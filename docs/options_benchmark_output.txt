@@ -1,0 +1,13 @@
+sessions: hedged=500 unhedged=500 flat=500 vega=500
+
+-- hedge band --
+end-of-session pnl_oracle stdev: unhedged=200.7164 hedged=33.6745
+stdev cut (unhedged / hedged): 5.960x
+gross edge_captured (hedged): 39893.92
+hedge_slippage (hedged): 2490.53
+cost of hedging as % of gross edge: 6.24%
+
+-- vega-scaled widening --
+gross edge_captured: flat=691510.51 vega=1872220.73
+adverse_selection: flat=77919.90 vega=77919.90
+adverse selection as % of gross edge: flat=11.27% vega=4.16%

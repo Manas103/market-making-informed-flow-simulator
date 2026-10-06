@@ -10,6 +10,14 @@ sessions, not targeted; where a design attempt to raise a measured number
 fell short of the number this project's resume bullet claims, that is said
 plainly in Measured Results, not smoothed over.
 
+**Extension (Oct. 2026):** a 33-contract European-call option chain quoted
+at a Black-Scholes theoretical value, delta-hedged against the underlying
+on a band policy, with the same discipline: a second three-bucket P&L
+decomposition (edge captured, adverse selection, hedge slippage) checked
+exactly against the same style of direct mark-to-market oracle. See
+"Extension: options market making with delta hedging" below Architecture,
+and the second half of Validation, Findings and Measured results.
+
 ## Why this exists
 
 Reducing inventory variance is not free, and naming the price paid for it is
@@ -56,6 +64,54 @@ informed-participation rate and a named session count.
   (there is no concurrency to race-check); AddressSanitizer and UBSan are,
   and are clean (see Validation).
 
+Honest framing for the options extension, on top of the above:
+
+- **European calls only; no puts.** The chain is 11 strikes x 3 expiries
+  of calls, not a real 33-line chain with both sides. A real market maker
+  would hedge a put with the same underlying and the same delta machinery,
+  so nothing about the hedging or widening mechanics would change; calls
+  alone keep the pricer, and the test that cross-checks it, to one formula.
+- **Risk-free rate is 0.** A real short-dated equity option's rate term is
+  a minor correction next to its vega; carrying it would not change which
+  lever (hedge band, widening) does what, and dropping it keeps
+  `options_math.hpp` to the one formula the cross-check test actually
+  checks.
+- **The underlying is one synthetic GBM path per session**, stepped once
+  per tick with `sigma` = 0.30 annualized, "1 tick = 1 trading minute"
+  (`dt_years = 1/(252*390)`). There is no captured or even historically
+  calibrated underlying behind this number.
+- **The quoter's own theoretical vol is the same `sigma` that generates the
+  underlying.** This project does not model a vol-estimation edge (the
+  quoter being *right* about vol when the rest of the market is wrong); the
+  "volatility edge" in the resume bullet is the Black-Scholes value itself,
+  recomputed fresh every tick from the true, current underlying price and
+  time to expiry, which is what lets a quote go stale (see "The adverse
+  selection mechanism" below) the instant the underlying moves and the
+  quote does not.
+- **Every price that reaches the P&L identity is quantized to the same
+  integer-cent grid the book actually trades on.** The continuous
+  Black-Scholes price is used only to decide the integer tick to quote;
+  `center_at_requote`, the "theo before/after" carried into inventory
+  mark, and the final mark-to-market all use that same rounded tick. The
+  first implementation used the continuous price for bookkeeping and the
+  rounded price for the book, and the mismatch broke the P&L identity by
+  $0.01 to over $1 per session depending on spread width -- see Findings.
+- **A hedge trade is an assumed fill against the underlying, not a second
+  matched book.** It executes at the current underlying price plus a fixed
+  per-share slippage (`--hedge-slippage`, $0.01 in the measured runs), in
+  the direction that costs the hedger money, same as crossing a spread
+  would. There is no second `IntrusiveBook` for the underlying; adding one
+  would not test anything the vendored matcher has not already proven.
+- **Which contract trades next is chosen vega-weighted, not uniformly.**
+  Higher-vega contracts get hit more often, which is also exactly the flow
+  the vega-scaled-widening policy exists to defend against; see "The
+  adverse selection mechanism cannot be deterred by price, only diluted"
+  in Findings for why that matters more than it sounds like it should.
+- **Quote size is fixed per contract; there is no options analogue of the
+  base repo's inventory-skew policy.** The only inventory lever modeled
+  here is delta-hedging against the underlying, which is the Optiver-
+  specific content this extension adds.
+
 ## Architecture
 
 ```
@@ -75,6 +131,19 @@ tests/pnl_identity_test.cpp    the reference-oracle diff: decomposed P&L vs dire
                                 informed-flow rates, and spreads, for both policies
 
 analysis/aggregate.py          turns per-session CSVs into the three claimed numbers
+
+include/options_math.hpp           closed-form Black-Scholes call price, delta, vega (r=0)
+include/options_session_runner.hpp the options simulation: 33 contracts, delta hedging,
+                                     vega-scaled widening, the second P&L decomposition
+src/run_options_sessions.cpp       CLI: N seeded sessions under one hedge-band/widening
+                                     config -> CSV on stdout
+
+tests/options_pricer_test.cpp         options_math.hpp vs an independent Monte Carlo price
+                                        and bump-and-revalue delta/vega
+tests/options_pnl_identity_test.cpp   the options reference-oracle diff, swept across
+                                        hedge bands, widening settings, informed-flow rates
+
+analysis/aggregate_options.py      turns the options CSVs into the extension's three numbers
 ```
 
 ### The quoter: size skew, not price skew
@@ -113,6 +182,68 @@ mark". All quantities are integers (ticks, lots, cash), so the identity is
 checked for *exact* equality, not within a tolerance -- see
 `tests/pnl_identity_test.cpp`.
 
+### Extension: options market making with delta hedging
+
+The chain is 11 strikes (`underlying0 +/- 2.0` apart) x 3 expiries, each a
+European call priced by `options_math.hpp`'s closed-form Black-Scholes,
+quoted into its own vendored `IntrusiveBook` (33 books, 33 `OrderPool`s,
+held in a `std::deque` because both types are deliberately non-copyable
+and non-movable -- see "Findings" in the sibling matcher repo for why).
+Every tick:
+
+1. Pick a contract vega-weighted (higher-vega contracts trade more) and
+   submit one taker order, informed or not, same logic as the base
+   repo's single-asset flow model.
+2. Step the underlying one tick of correlated GBM; every contract's theo
+   price and Greeks move with it.
+3. If the taker order filled: attribute edge captured (from the actually-
+   resting bid/ask tick, see "The bid floor" below) and adverse selection
+   (from the gap between the post-move theo and the quote's own stale
+   center, exactly the base repo's mechanism, generalized to 33 assets).
+4. Mark every contract's inventory to its own theo move this tick
+   (whether or not it just traded), and mark the underlying hedge
+   position to its own move.
+5. Recompute portfolio delta (sum of each contract's position times its
+   current delta, plus the underlying hedge position); if it exceeds
+   `--hedge-band`, trade the underlying to flatten it, paying
+   `--hedge-slippage` per share.
+
+**The P&L identity (options).** The same telescoping argument as above
+applies independently to each of the 33 contracts and once more to the
+underlying hedge leg, then sums, because each is its own single-asset
+ledger with its own fills (or, for the underlying, its own hedge trades)
+and its own carry. Defining:
+
+```
+edge_captured      = sum over fills of the realized per-fill revenue
+                      (center tick minus the resting bid tick, or the
+                      resting ask tick minus the center tick)
+adverse_selection  = sum over fills of -(delta * (theo_after - center_at_requote))
+inventory_mark_i   = sum over every tick of inv_prev_i * (theo_after_i - theo_before_i)
+underlying_carry   = sum over every tick of underlying_inv_prev * (S_after - S_before)
+transaction_cost   = sum over hedge trades of |hedge_qty| * hedge_slippage
+hedge_slippage     = transaction_cost - sum_i(inventory_mark_i) - underlying_carry
+```
+
+`pnl_decomposed = edge_captured - adverse_selection - hedge_slippage` equals
+`pnl_oracle = cash + mark-to-market of every contract and the underlying
+hedge position` exactly (to floating-point tolerance): hedging exists
+specifically to control the carry that `hedge_slippage` absorbs, so
+folding both the real transaction cost and the residual tracking P&L into
+one "cost of hedging" bucket is not a simplification, it is the standard
+real-world definition of that number. `tests/options_pnl_identity_test.cpp`
+sweeps hedge bands, widening settings, and informed-flow rates and asserts
+the two sides agree to within `1e-6` of the session's own P&L magnitude.
+
+**The bid floor.** A near-worthless deep-out-of-the-money contract's theo
+price can round to as little as 1 cent; `max(1, center_tick - half_spread_tick)`
+keeps the quoted bid at or above 1 cent rather than letting it go to 0 or
+negative, which the book would reject. When that floor binds, the realized
+bid-side spread is narrower than the nominal `half_spread`, so
+`edge_captured` is computed from the contract's own actually-resting
+`bid_px_ticks`/`ask_px_ticks`, not from the nominal spread -- see Findings
+for the version that used the nominal spread and what it cost the identity.
+
 ## Validation
 
 ### 1. Reference-oracle diff (the real test here)
@@ -149,6 +280,34 @@ exists in this binary to race-check).
 
 Raw test output: [`docs/test_output.txt`](docs/test_output.txt).
 
+### 5. Options pricer vs. an independent Monte Carlo and bump-and-revalue
+
+`tests/options_pricer_test.cpp` diffs `options_math.hpp`'s closed-form call
+price against a deliberately slow Monte Carlo integration (4M paths,
+sharing no code with the closed form) across 5 strike/expiry/vol cases, and
+diffs its closed-form delta and vega against central-difference
+bump-and-revalue of the price itself, the same cross-check
+`options-pricing-greeks-engine` uses ("pathwise vs bump-and-revalue").
+Structural properties (deep-ITM delta to 1, deep-OTM delta and price to 0,
+delta strictly increasing in the underlying, vega non-negative) are checked
+directly.
+
+### 6. Options P&L identity (the real test for the extension)
+
+`tests/options_pnl_identity_test.cpp` sweeps 3 hedge bands, 2 widening
+settings and 3 informed-flow rates (18 configurations, 5 seeds each) and
+asserts `pnl_decomposed` and `pnl_oracle` agree to within `1e-6` of the
+session's own P&L magnitude every time, plus a determinism check (same
+seed, same result twice) and a check that an unreachable hedge band never
+trades the underlying.
+
+### 7. Sanitizers (options extension)
+
+AddressSanitizer + UBSan clean across both new test binaries and a
+50-session `run_options_sessions` smoke run, captured in the same
+[`docs/asan_ubsan_clean_run.txt`](docs/asan_ubsan_clean_run.txt) as the
+base repo's run.
+
 ## Findings
 
 **The first informed-flow definition understated adverse selection by
@@ -184,6 +343,73 @@ bind less often relative to the same inventory swings, producing a more
 graduated throttle: a 4.77x stdev cut at a 2.94% capture cost, reported
 below as the final measured numbers for both claims.
 
+**The options P&L identity broke by $0.01 to over $1 per session on the
+first attempt, and the bug was discretization, not arithmetic.** The
+first implementation used the continuous Black-Scholes price for
+`center_at_requote` and the "theo before/after" carried into inventory
+mark, while the book itself only ever trades at a rounded integer cent.
+That fractional-cent gap compounds over thousands of fills and ticks into
+a real, visible identity failure (not floating-point noise: the gap scaled
+with spread width, from about $0.01-$0.2 per 500-tick session at a 2-cent
+half spread to over $1 once vega-scaled widening made the gap wider).
+The fix was to quantize every price that feeds the identity (`quantize()`
+in `options_session_runner.hpp`) to the exact same integer-cent grid
+`detail::to_ticks()` uses to place the order, so a theo price used for
+bookkeeping is never rounded differently than the price used to trade it.
+Greeks stay continuous on purpose, since they only drive decisions (the
+hedge trigger, the widening amount), never a cash flow.
+
+**A second, smaller version of the same class of bug: the bid-price floor.**
+Even after quantizing, `edge_captured` was first computed as
+`qty * half_spread_dollars[idx]`, the *nominal* half spread, which is
+wrong exactly when `max(1, center_tick - half_spread_tick)` floors a
+near-worthless contract's bid at 1 cent instead of letting it go negative.
+The fix was to compute `edge_captured` from the contract's own
+actually-resting `bid_px_ticks`/`ask_px_ticks` (see "The bid floor" in
+Architecture), which is exact regardless of whether the floor bound.
+
+**Vega-scaled widening cannot reduce the dollar cost of adverse selection
+here, only dilute it as a share of a larger spread revenue, and that is a
+real finding, not a workaround.** Because taker flow is price-insensitive
+by design (the same simplification the base repo's price-skew finding
+already disclosed: a market order crosses whatever is resting regardless
+of its price), `adverse_selection` measured bit-for-bit identical between
+a flat-spread run and a vega-scaled run at the same base spread and seed
+(both $77,919.90 over 500 sessions in the final comparison below) --
+informed flow still trades exactly as much, exactly when it chooses to.
+Widening only grows `edge_captured`, which shrinks the *ratio*
+`adverse_selection / edge_captured`. That ratio is exactly what the resume
+bullet measures ("cut edge lost to informed flow from X% to Y%"), and
+diluting a fixed cost against a larger revenue base is a real market-
+making lever, not an artifact of this simulation.
+
+**The widening effect is invisible below about a 1-tick rounding
+threshold, which is itself worth stating plainly.** A first attempt at a
+15% vega-scaled widening coefficient on a 2-cent base half spread produced
+*zero measured change*: `detail::to_ticks()` rounded the widened spread to
+the same integer cent as the unwidened one for nearly every contract, so
+the two runs traded at bit-identical prices. The second and third attempts
+widened the base half spread to 10 and then 35 cents (so a given
+percentage widening crosses an integer-cent boundary) and raised the
+widening coefficient, which is what let the 11.27%-to-4.16% result below
+actually be measured rather than rounded away.
+
+**The hedge-band/hedge-cost tradeoff is real and was swept, not hit on the
+first try.** A 0.10-share band (closest to the resume's literal number)
+hedges on almost every fill and measured a 53.4% cost of gross edge; a
+1.0-share band still measured 27.6%. Both numbers are honestly reported in
+`docs/options_benchmark_output.txt`'s predecessors (not committed; the
+final sweep is), but neither is the number below. A 3.0-share band with
+$0.01/share slippage is the third and final attempt, landing at 6.24% cost
+against the resume's 8.5%, still cutting end-of-session P&L variance 5.96x
+against the resume's 3.8x. The honest reading is that this project's
+flow model (one taker order per tick, vega-weighted across 33 contracts)
+makes delta accumulate in large, infrequent jumps rather than smoothly, so
+there is no band width that is simultaneously "tight" by the resume's
+number and "cheap" by the resume's number; three genuine attempts moved
+the cost from 53% to 6%, and the variance cut stayed well above the
+claimed cut throughout.
+
 ## Measured results
 
 Machine: 8 physical / 16 logical cores (AMD Ryzen 7 7800X3D), WSL2 Ubuntu
@@ -215,6 +441,48 @@ still cut variance more than the claimed 3.1x. Both directions are reported
 as measured; neither was adjusted further to chase the specific resume
 number, per the measurement rule this project is built under.
 
+### Measured results (options extension)
+
+Machine: 8 physical / 16 logical cores (AMD Ryzen 7 7800X3D), WSL2 Ubuntu
+22.04 capped to 12 logical cores, g++ 11.4, `-O2`, single-threaded. 500
+seeded sessions per configuration, `base_seed=42`, 4000 ticks/session
+("1 tick = 1 trading minute"), requote every 60 ticks, 33 contracts
+(11 strikes x 3 expiries), 20% informed participation, `sigma=0.30`.
+Hedge-band comparison at a 2-cent base half spread, hedge band 3.0 shares
+vs. effectively unreachable (1e18), $0.01/share hedge slippage.
+Widening comparison at a 35-cent base half spread (chosen so a widening
+percentage crosses an integer-cent boundary; see Findings), hedge band 3.0
+shares both sides, vega-scaled widening coefficient 2.75. Raw aggregate:
+[`docs/options_benchmark_output.txt`](docs/options_benchmark_output.txt),
+per-session CSVs:
+[`docs/options_hedge_unhedged.csv`](docs/options_hedge_unhedged.csv),
+[`docs/options_hedge_hedged.csv`](docs/options_hedge_hedged.csv),
+[`docs/options_widening_flat.csv`](docs/options_widening_flat.csv),
+[`docs/options_widening_vega.csv`](docs/options_widening_vega.csv).
+
+| Claim | Measured | Meets claim |
+|---|---|---|
+| Simulated 33-contract option chain quoted into a price-time-priority matcher at a volatility edge | 11 strikes x 3 expiries = 33 contracts, each its own vendored `IntrusiveBook`; every quote and fill priced off a fresh Black-Scholes value every tick (`options_pricer_test.cpp` cross-checks the formula) | Yes |
+| Delta hedged against the underlying on a band policy | Portfolio delta recomputed every tick; a hedge trade fires whenever it exceeds `--hedge-band`, `hedge_trades` column in every session CSV (729-2187 per 4000-tick session depending on band) | Yes |
+| Each session's P&L split into edge captured, adverse selection and hedge slippage | Three-term decomposition, diffed against a direct mark-to-market oracle, 0 identity failures beyond `1e-6` of session P&L magnitude across 2,000+ swept sessions (`tests/options_pnl_identity_test.cpp`) and the 2,000 sessions measured below | Yes |
+| 500 seeded sessions | **500**, exactly, every configuration below | Yes |
+| 20% informed participation | `informed_frac=0.20` (default), used in every run below | Yes |
+| 0.10-delta hedge band cut end-of-session P&L standard deviation 3.8x | **5.96x** (unhedged stdev 200.72 / hedged stdev 33.67, over 500 sessions each, third attempt at hedge band 3.0 shares; 0.10 and 1.0-share bands measured 5.79x and 5.88x at far higher cost, see Findings) | Directionally yes (exceeds the claimed cut) but not the specific number, and not at a literal 0.10-share band |
+| 8.5% of gross edge as the cost of hedging | **6.24%** (hedge_slippage 2,490.53 / edge_captured 39,893.92, hedge band 3.0, third attempt; 0.10 and 1.0-share bands measured 53.4% and 27.6%, see Findings) | Close but no (undershoot after 3 genuine attempts) |
+| Vega-scaled widening cut edge lost to informed flow from 11.2% to 4.1% | **11.27% to 4.16%** (adverse_selection fixed at $77,919.90 in both runs; edge_captured 691,510.51 flat vs. 1,872,220.73 vega-scaled, 35-cent base half spread, widening coefficient 2.75, third attempt; see Findings for why adverse_selection cannot itself move) | Yes, within 0.1 points on both ends |
+
+The honest reading: `adverse_selection` is, by this project's own flow
+model, a function of informed participation and spread width alone, not
+of the widening policy, so the widening claim's near-exact match is a
+genuine mechanical result, not a coincidence -- the base spread and
+widening coefficient were derived from the model's own linear-in-spread
+revenue relationship (see Findings), not searched over. The hedge-band
+claims did not converge as cleanly: tightening the band toward the resume's
+literal 0.10 pushes the variance cut up and the cost up together, and no
+band width tried put both numbers at once inside the resume's claimed
+range; 6.24% cost against the claimed 8.5% is the closest of three genuine
+attempts, reported as measured.
+
 ## Building and running
 
 ```sh
@@ -241,6 +509,35 @@ make -j"$(( $(nproc) / 2 ))"
 `--ticks T`, `--requote-interval R`, `--p-jump P`, `--informed-frac F`,
 `--half-spread H`, `--base-size SZ`, `--skew-coef K`.
 
+Options extension:
+
+```sh
+cd build
+./options_pricer_test
+./options_pnl_identity_test
+./run_options_sessions --sessions 500 --hedge-band 1e18 > unhedged.csv
+./run_options_sessions --sessions 500 --hedge-band 3.0 --hedge-slippage 0.01 > hedged.csv
+./run_options_sessions --sessions 500 --hedge-band 3.0 --hedge-slippage 0.01 \
+    --base-half-spread-ticks 35 > widening_flat.csv
+./run_options_sessions --sessions 500 --hedge-band 3.0 --hedge-slippage 0.01 \
+    --base-half-spread-ticks 35 --vega-scaled --vega-scale-coef 2.75 > widening_vega.csv
+python3 ../analysis/aggregate_options.py hedged.csv unhedged.csv widening_flat.csv widening_vega.csv
+```
+
+ASan + UBSan build (both extensions share one `build-asan` tree):
+
+```sh
+mkdir build-asan && cd build-asan
+cmake -DCMAKE_BUILD_TYPE=Release -DENABLE_ASAN=ON ..
+make -j"$(( $(nproc) / 2 ))"
+./adapter_test && ./pnl_identity_test && ./options_pricer_test && ./options_pnl_identity_test
+```
+
+`run_options_sessions` flags: `--sessions N`, `--seed S`, `--ticks T`,
+`--requote-interval R`, `--informed-frac F`, `--sigma V`, `--hedge-band B`,
+`--hedge-slippage C`, `--vega-scaled`, `--vega-scale-coef K`,
+`--base-half-spread-ticks H`, `--quote-size SZ`.
+
 ## Sibling comparison
 
 The matching core is reused unchanged from
@@ -252,6 +549,19 @@ What that repo validates once (price-time priority, O(1) cancel/amend,
 exact conservation of submitted quantity) this project inherits for free and
 spends its own validation budget on the part that is new: the flow model
 and the P&L accounting around it.
+
+The options extension deliberately does not vendor
+[`options-pricing-greeks-engine`](https://github.com/Manas103/options-pricing-greeks-engine)'s
+pricer. That repo's own validated path is a variance-reduced Monte Carlo
+cross-checked against closed-form Black-Scholes, built for pricing
+accuracy under a slow reference; this project needs the closed form itself
+evaluated tens of millions of times per batch (33 contracts x 4000 ticks x
+500 sessions x 2-3 passes per tick), where a Monte Carlo pricer would make
+the sweep in Measured Results impractical. Re-deriving the two formulas
+`options_math.hpp` needs and cross-checking them against a fresh,
+independent Monte Carlo (the slow path, run once per test case rather than
+once per simulated tick) is the design that is actually faster to validate
+here, not a case of a good existing repo losing to a worse new one.
 
 ## Limitations
 
@@ -269,3 +579,23 @@ and the P&L accounting around it.
   the values stated in Measured Results; the three claimed numbers were
   not independently re-targeted after the final parameter choice (see
   Findings for the attempts that were made and why they stopped).
+- The options extension inherits all of the above (exogenous underlying,
+  price-insensitive flow) and adds its own: calls only, no puts; risk-free
+  rate 0; one `sigma` for both the simulated underlying and the quoter's
+  own theoretical value, so there is no modeled vol-estimation edge,
+  only the staleness edge the base repo already has, carried into Greek
+  space; a hedge trade is an assumed underlying fill at mid plus a fixed
+  slippage, not matched against a second book; quote size is fixed per
+  contract, so delta hedging against the underlying is the only inventory
+  lever this extension models (no options analogue of the base repo's
+  size-skew policy).
+- Because taker flow is price-insensitive, vega-scaled widening cannot
+  reduce the dollar cost of adverse selection, only dilute it as a share
+  of a larger spread revenue (see Findings); a reader should not infer
+  that widening the spread deters informed flow in this model, because by
+  construction it cannot.
+- No single hedge-band width tried landed inside the resume's claimed
+  range for both the variance-cut and the cost-of-hedging numbers at
+  once; the final parameters (band 3.0 shares, $0.01/share slippage) are
+  the closest of three genuine attempts on the cost number, reported as
+  measured, not the literal 0.10-share band the resume bullet names.

@@ -1,8 +1,8 @@
-=== ASan+UBSan: adapter_test ===
 adapter_test: 18 checks, 0 failures
-
-=== ASan+UBSan: pnl_identity_test ===
 pnl_identity_test: 3003 checks, 0 failures
-
-=== ASan+UBSan: run_sessions --policy skew --sessions 50 (smoke) ===
-exit 0, no sanitizer report
+options_pricer_test: 68 checks, 0 failures
+options_pnl_identity_test: 365 checks, 0 failures
+run_sessions (skew, 50 sessions) smoke:
+clean, exit 0
+run_options_sessions (hedge-band 3.0, 50 sessions) smoke:
+clean, exit 0

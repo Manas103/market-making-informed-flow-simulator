@@ -34,6 +34,19 @@ add_executable(pnl_identity_test tests/pnl_identity_test.cpp)
 target_link_libraries(pnl_identity_test PRIVATE mmsim)
 target_include_directories(pnl_identity_test PRIVATE tests)
 
+add_executable(run_options_sessions src/run_options_sessions.cpp)
+target_link_libraries(run_options_sessions PRIVATE mmsim)
+
+add_executable(options_pricer_test tests/options_pricer_test.cpp)
+target_link_libraries(options_pricer_test PRIVATE mmsim)
+target_include_directories(options_pricer_test PRIVATE tests)
+
+add_executable(options_pnl_identity_test tests/options_pnl_identity_test.cpp)
+target_link_libraries(options_pnl_identity_test PRIVATE mmsim)
+target_include_directories(options_pnl_identity_test PRIVATE tests)
+
 enable_testing()
 add_test(NAME adapter COMMAND adapter_test)
 add_test(NAME pnl_identity COMMAND pnl_identity_test)
+add_test(NAME options_pricer COMMAND options_pricer_test)
+add_test(NAME options_pnl_identity COMMAND options_pnl_identity_test)

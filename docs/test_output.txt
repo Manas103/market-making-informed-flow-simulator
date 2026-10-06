@@ -1,5 +1,4 @@
-=== adapter_test ===
 adapter_test: 18 checks, 0 failures
-
-=== pnl_identity_test ===
 pnl_identity_test: 3003 checks, 0 failures
+options_pricer_test: 68 checks, 0 failures
+options_pnl_identity_test: 365 checks, 0 failures
