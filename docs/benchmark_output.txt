@@ -1,0 +1,8 @@
+sessions: fixed=500 skew=500
+gross_capture (fixed): sum=3721396 mean=7442.8
+gross_capture (skew):  sum=3612052 mean=7224.1
+adverse_cost (fixed):  sum=161592
+adverse-selection give-back (fixed, informed_frac from input file): 0.0434
+final_inventory stdev: fixed=41.586 skew=8.725
+inventory stdev cut (fixed / skew): 4.766x
+gross capture cost of skewing: 0.0294

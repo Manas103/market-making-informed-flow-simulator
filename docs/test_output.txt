@@ -1,0 +1,5 @@
+=== adapter_test ===
+adapter_test: 18 checks, 0 failures
+
+=== pnl_identity_test ===
+pnl_identity_test: 3003 checks, 0 failures

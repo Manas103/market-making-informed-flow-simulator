@@ -1,0 +1,21 @@
+build/
+build-*/
+*.o
+*.obj
+*.exe
+*.out
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+__pycache__/
+venv/
+.pytest_cache/
+*.log
+
+# Per-session CSVs regenerate via:
+#   ./build/run_sessions --policy fixed --sessions 500 > sessions.csv
+#   ./build/run_sessions --policy skew --sessions 500 > sessions.csv
+# The two baseline runs under docs/ are kept (small, and what the README's
+# numbers are traced to); anything else generated ad hoc is not.
+*.csv
+!docs/*.csv
