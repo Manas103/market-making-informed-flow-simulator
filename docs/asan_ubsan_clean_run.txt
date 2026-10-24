@@ -1,8 +1,20 @@
+AddressSanitizer + UndefinedBehaviorSanitizer run of the full test suite.
+Build: cmake -DENABLE_ASAN=ON, g++ 11.4.0, -fsanitize=address,undefined -O1 -g.
+
+=============== adapter_test ===============
 adapter_test: 18 checks, 0 failures
+
+=============== pnl_identity_test ===============
 pnl_identity_test: 3003 checks, 0 failures
+
+=============== attribution_identity_test ===============
+attribution_identity_test: 15046 checks, 0 failures
+
+=============== options_pricer_test ===============
 options_pricer_test: 68 checks, 0 failures
+
+=============== options_pnl_identity_test ===============
 options_pnl_identity_test: 365 checks, 0 failures
-run_sessions (skew, 50 sessions) smoke:
-clean, exit 0
-run_options_sessions (hedge-band 3.0, 50 sessions) smoke:
-clean, exit 0
+
+=============== run_attribution smoke (50 sessions) ===============
+50 sessions, 185799 fills written

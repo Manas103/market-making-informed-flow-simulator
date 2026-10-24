@@ -18,6 +18,14 @@ exactly against the same style of direct mark-to-market oracle. See
 "Extension: options market making with delta hedging" below Architecture,
 and the second half of Validation, Findings and Measured results.
 
+**Extension (Oct. 2026):** a per-fill post-trade attribution view on the
+original single-asset simulation: the same three-bucket decomposition
+(spread captured, adverse selection paid, inventory mark), now computed
+and reconciled per fill rather than only at the session level, plus
+markouts at 1, 10 and 60 ticks after each fill. See "Extension: per-fill
+post-trade attribution" below Architecture, and the third part of
+Validation, Findings and Measured results.
+
 ## Why this exists
 
 Reducing inventory variance is not free, and naming the price paid for it is
@@ -112,6 +120,44 @@ Honest framing for the options extension, on top of the above:
   here is delta-hedging against the underlying, which is the Optiver-
   specific content this extension adds.
 
+Honest framing for the per-fill attribution extension, on top of the above:
+
+- **"Per fill" means every unit of the session-level decomposition is
+  attributed to exactly one fill, with no double counting and no
+  unattributed remainder.** `spread_captured` and `adverse_selection` are
+  computed at the fill itself; the ongoing inventory carry
+  (`inventory_mark`) is attributed to whichever fill most recently set the
+  position being carried, since a carry cost only exists because some
+  earlier fill put inventory on the book. This is a modeling choice, not
+  the only valid one, and it is stated plainly so a reader can judge it:
+  an alternative would spread the carry evenly across the holding period
+  by time rather than crediting it all to the fill that opened it.
+- **Markout is measured from the price actually traded, not from fair
+  value at the moment of the fill.** `markout_h = sign * (fair_value at
+  t+h - fill_price)`, sign positive when favorable to the market maker.
+  Because `fill_price` already differs from fair value by the half spread,
+  an uninformed fill's markout is dominated by that captured spread, not
+  by zero; see Findings for the sanity check this implies and what it
+  means for reading the numbers below.
+- **"1 tick = 1 second" for the markout horizons (1, 10, 60), the same
+  style of unit assignment the options extension already makes ("1 tick =
+  1 trading minute").** The base simulation's tick itself carries no
+  wall-clock unit; this is the one place that matters here, since the
+  resume bullet names seconds specifically.
+- **Markout horizons beyond session end are clamped to the last tick**,
+  flagged per fill (`markout_*_clamped`), not extrapolated or dropped.
+- **This extension reuses the base simulation's session mechanics
+  unchanged.** The per-fill ledger is an optional side channel
+  (`fill_log`) `SessionRunner::run` populates when a caller asks for it;
+  every number the base repo and the options extension already measure
+  (via the no-argument call) is bit-for-bit the same as before this
+  extension, which `tests/pnl_identity_test.cpp` and
+  `tests/options_pnl_identity_test.cpp` still prove on every run.
+- **500 fixed-policy sessions, the same baseline configuration this
+  repo's own Measured Results already uses**, not a new parameter sweep;
+  the point of this extension is the per-fill view, not a new headline
+  number for the policy comparison that is already measured below.
+
 ## Architecture
 
 ```
@@ -144,6 +190,11 @@ tests/options_pnl_identity_test.cpp   the options reference-oracle diff, swept a
                                         hedge bands, widening settings, informed-flow rates
 
 analysis/aggregate_options.py      turns the options CSVs into the extension's three numbers
+
+src/run_attribution.cpp            CLI: N seeded sessions -> sessions.csv + a per-fill fills.csv
+tests/attribution_identity_test.cpp  per-fill ledger sums reconcile exactly to the session
+                                       oracle, swept across policies and informed-flow rates
+analysis/attribution.py            DuckDB: reconciliation query + markout summary by informed flag
 ```
 
 ### The quoter: size skew, not price skew
@@ -244,6 +295,45 @@ bid-side spread is narrower than the nominal `half_spread`, so
 `bid_px_ticks`/`ask_px_ticks`, not from the nominal spread -- see Findings
 for the version that used the nominal spread and what it cost the identity.
 
+### Extension: per-fill post-trade attribution
+
+The base simulation already proves one P&L identity at the session level;
+this extension proves the same identity holds when the three terms are
+attributed fill by fill instead of summed once at the end, and adds the
+one post-trade metric a session-level view cannot answer at all: how did
+fair value move *after* each individual fill.
+
+**Attributing `spread_captured` and `adverse_selection`.** Both are
+already per-event quantities inside `SessionRunner::run`'s loop (`qty *
+half_spread` and `-(delta * (v_after_jump - center_at_requote))`); the
+extension's only change here is writing them into a `FillRecord` instead
+of only adding them into the session's running totals.
+
+**Attributing `inventory_mark`.** This term is different: it accrues
+every tick, whether or not a fill happens that tick, because it is the
+cost (or benefit) of *carrying* whatever inventory is currently on the
+book. The extension attributes each tick's carry to the most recent fill,
+tracked as `last_fill_idx` while the session runs: a tick's carry uses
+`inv_prev`, the inventory level set by that most recent fill, so crediting
+the carry to that same fill keeps the attribution mechanically exact
+rather than approximate. The one subtlety is ordering: on a tick that
+itself contains a new fill, that tick's carry (computed from `inv_prev`,
+*before* the new fill) is credited to the *previous* fill, and only the
+*next* fill's `inv_before` reflects the position the new fill just
+created. Before any fill has happened, `inv` is still exactly 0, so the
+carry is 0 and has nowhere to go; the code skips attributing it rather
+than attributing a true zero to a fill that does not exist yet.
+
+**Markouts.** `vpath`, the fair value immediately after each tick's jump,
+is collected once per session (only when a caller asks for the per-fill
+ledger, so the no-argument call path pays nothing extra). After the
+session loop finishes, each fill looks up `vpath` at `tick + 1`, `tick +
+10` and `tick + 60`, clamping to the last tick and flagging when it does.
+Measuring from `fill_price` rather than from fair value at the fill
+(`v_quote`) means the half spread the market maker captured is baked into
+the markout number from the first tick onward; see Findings for what that
+implies about reading the measured numbers.
+
 ## Validation
 
 ### 1. Reference-oracle diff (the real test here)
@@ -307,6 +397,27 @@ AddressSanitizer + UBSan clean across both new test binaries and a
 50-session `run_options_sessions` smoke run, captured in the same
 [`docs/asan_ubsan_clean_run.txt`](docs/asan_ubsan_clean_run.txt) as the
 base repo's run.
+
+### 8. Per-fill reconciliation (the real test for this extension)
+
+Two independent layers:
+
+- `tests/attribution_identity_test.cpp` sweeps both policies across 4
+  informed-flow rates, 10 seeds each (80 sessions), and asserts, for every
+  session, that summing `spread_captured`, `adverse_selection` and
+  `inventory_mark_share` across its fills reproduces `gross_capture`,
+  `adverse_cost` and `inventory_mark` exactly, plus a determinism check
+  (same seed, same fill log, including markouts, on a second run). 15,046
+  checks.
+- `analysis/attribution.py` re-does the same reconciliation independently
+  in DuckDB SQL, over the real 500-session CSV pair `run_attribution`
+  produces (not a re-run of the C++ test), which is what the raw output in
+  [`docs/attribution_output.txt`](docs/attribution_output.txt) shows: 500
+  sessions, 0 mismatches.
+
+AddressSanitizer + UBSan clean on `attribution_identity_test` and a
+50-session `run_attribution` smoke run, in the same
+[`docs/asan_ubsan_clean_run.txt`](docs/asan_ubsan_clean_run.txt).
 
 ## Findings
 
@@ -410,6 +521,20 @@ number and "cheap" by the resume's number; three genuine attempts moved
 the cost from 53% to 6%, and the variance cut stayed well above the
 claimed cut throughout.
 
+**Markout, measured from the actual fill price, is dominated by the spread
+captured, and that is expected, not a flaw in the metric.** The first
+measurement (below) showed uninformed fills averaging a markout within
+noise of the 2-tick half spread, and informed fills averaging well below
+it, never negative. That is the correct behavior for this definition: a
+fill's markout starts at (roughly) `+half_spread` purely from the spread
+captured, and informed flow's exploited gap only erodes that baseline, it
+does not independently drag the number negative in this model, because the
+jump that creates the exploitable gap is itself bounded (one tick, one
+direction) relative to a 2-tick spread. A reader who wants a markout metric
+that isolates adverse selection with zero spread contribution baked in
+would instead measure from `v_quote`, not from `fill_price`; both are
+documented explicitly above so neither is mistaken for the other.
+
 ## Measured results
 
 Machine: 8 physical / 16 logical cores (AMD Ryzen 7 7800X3D), WSL2 Ubuntu
@@ -483,6 +608,36 @@ band width tried put both numbers at once inside the resume's claimed
 range; 6.24% cost against the claimed 8.5% is the closest of three genuine
 attempts, reported as measured.
 
+### Measured results (per-fill attribution extension)
+
+Machine: 8 physical / 16 logical cores (AMD Ryzen 7 7800X3D), WSL2 Ubuntu
+22.04 capped to 12 logical cores, g++ 11.4, `-O2`, single-threaded. 500
+seeded sessions, fixed-size policy, `base_seed=42`, the same baseline
+configuration as this README's own Measured Results above (4000
+ticks/session, half-spread 2 ticks, 20% informed participation). Raw
+output: [`docs/attribution_output.txt`](docs/attribution_output.txt);
+per-session CSV: [`docs/attribution_sessions.csv`](docs/attribution_sessions.csv)
+(the per-fill CSV is 1,860,698 rows, too large to commit; regenerate it
+with the command below).
+
+| Claim | Measured | Meets claim |
+|---|---|---|
+| 500 seeded simulated market-making sessions | **500**, exactly | Yes |
+| Realized P&L per fill split into spread captured, adverse selection paid and inventory mark | Every one of 1,860,698 fills carries its own `spread_captured`, `adverse_selection`, `inventory_mark_share` | Yes |
+| Reconciled to a mark-to-market oracle as an exact integer identity | **0 mismatches** across 500 sessions (DuckDB reconciliation, [`docs/attribution_output.txt`](docs/attribution_output.txt)); also proven for 80 additional swept sessions in `tests/attribution_identity_test.cpp` | Yes |
+| Markouts at 1, 10 and 60 seconds | Measured at 1, 10 and 60 ticks under the "1 tick = 1 second" convention stated in Honest framing: mean markout, uninformed fills **2.06 / 2.06 / 2.06** ticks, informed fills **0.62 / 0.61 / 0.60** ticks, n=1,670,952 / 189,746 | Yes |
+| Inventory-skew quoting policy cut end-of-session position stdev 4.77x | **4.77x**, cited unchanged from this README's own Measured Results (not re-measured; this extension does not touch the skew policy) | Yes |
+| 2.94% of gross capture | **2.94%**, cited unchanged, same reason | Yes |
+
+The honest reading on markouts: informed fills' mean markout is 0.60-0.62
+ticks against uninformed fills' 2.06, roughly a 70% erosion of the
+spread-dominated baseline, which is the same adverse-selection signal this
+README's `adverse_cost` number already reports, now visible fill by fill
+and over a forward time horizon instead of only in a session-level sum.
+Neither number is negative, and Findings explains precisely why that is
+the expected result of measuring from the actual fill price rather than
+from fair value at the quote.
+
 ## Building and running
 
 ```sh
@@ -537,6 +692,28 @@ make -j"$(( $(nproc) / 2 ))"
 `--requote-interval R`, `--informed-frac F`, `--sigma V`, `--hedge-band B`,
 `--hedge-slippage C`, `--vega-scaled`, `--vega-scale-coef K`,
 `--base-half-spread-ticks H`, `--quote-size SZ`.
+
+Per-fill attribution extension:
+
+```sh
+cd build
+./attribution_identity_test
+./run_attribution --policy fixed --sessions 500 --seed 42 \
+    --sessions-csv sessions.csv --fills-csv fills.csv
+python3 -m venv ../analysis/.venv && source ../analysis/.venv/bin/activate
+pip install -r ../analysis/requirements.txt
+python3 ../analysis/attribution.py sessions.csv fills.csv
+```
+
+`run_attribution` flags: `--policy fixed|skew`, `--sessions N`, `--seed S`,
+`--informed-frac F`, `--sessions-csv PATH`, `--fills-csv PATH`.
+
+ASan + UBSan (same `build-asan` tree as above):
+
+```sh
+./attribution_identity_test
+./run_attribution --policy fixed --sessions 50 --sessions-csv /tmp/s.csv --fills-csv /tmp/f.csv
+```
 
 ## Sibling comparison
 
@@ -599,3 +776,15 @@ here, not a case of a good existing repo losing to a worse new one.
   once; the final parameters (band 3.0 shares, $0.01/share slippage) are
   the closest of three genuine attempts on the cost number, reported as
   measured, not the literal 0.10-share band the resume bullet names.
+- **The per-fill attribution extension inherits every limitation of the
+  base simulation above** (exogenous fair value, price-insensitive flow,
+  fixed-size takers), plus its own: carrying `inventory_mark` entirely to
+  the most recent fill is one defensible attribution convention, not the
+  only one, and a reader who wants a time-weighted carry split would need
+  to change that rule; markout is measured from the actual fill price, so
+  it is not a clean, zero-baseline adverse-selection metric by itself (use
+  the existing `adverse_cost`/`adverse_selection` fields for that); "1 tick
+  = 1 second" for the markout horizons is a stated unit convention, not a
+  measured wall-clock correspondence; and the per-fill CSV `run_attribution`
+  produces (1.86M rows for 500 sessions) is not committed, only the raw
+  DuckDB summary is, because of its size.

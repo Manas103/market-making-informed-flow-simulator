@@ -68,6 +68,38 @@ struct SessionResult {
     bool identity_ok = false;
 };
 
+// One market-maker fill, attributed to its own slice of the three-bucket
+// P&L decomposition (see "Extension: per-fill post-trade attribution" in
+// the README). `inventory_mark_share` is filled in incrementally as later
+// ticks' carry accrues against the position *this* fill set, up until the
+// next fill replaces it -- so it is only final once the session has
+// finished running, which is why it lives behind a pointer the caller owns
+// rather than being returned complete.
+struct FillRecord {
+    uint64_t session_id = 0;
+    int tick = 0;
+    bool mm_bought = false;
+    int64_t qty = 0;
+    int64_t fill_price = 0;    // v_quote +/- half_spread, the actual traded tick
+    int64_t v_quote = 0;       // center_at_requote: the stale quote this fill hit
+    int64_t inv_before = 0;
+    bool informed = false;
+    int64_t spread_captured = 0;
+    int64_t adverse_selection = 0;
+    int64_t inventory_mark_share = 0;
+
+    // Signed so that positive always means favorable to the market maker;
+    // see "Extension: per-fill post-trade attribution" for the exact
+    // definition. *_clamped is true when the horizon ran past session end,
+    // in which case the value above is measured to the last tick instead.
+    int64_t markout_1 = 0;
+    int64_t markout_10 = 0;
+    int64_t markout_60 = 0;
+    bool markout_1_clamped = false;
+    bool markout_10_clamped = false;
+    bool markout_60_clamped = false;
+};
+
 namespace detail {
 
 // Submits a New order and reports any resulting trades. The node is
@@ -107,7 +139,13 @@ class SessionRunner {
 public:
     explicit SessionRunner(const SessionParams& p) : p_(p) {}
 
-    SessionResult run(uint64_t session_id) const {
+    // `fill_log`, when non-null, is appended with one FillRecord per fill
+    // in this session (existing entries are left alone, so a caller can
+    // accumulate fills across many sessions into one vector). Passing it
+    // changes no arithmetic on the aggregate SessionResult: every quantity
+    // computed below is identical to the no-argument path, just also
+    // mirrored into the per-fill ledger as it goes.
+    SessionResult run(uint64_t session_id, std::vector<FillRecord>* fill_log = nullptr) const {
         std::seed_seq seed{p_.base_seed, session_id};
         std::mt19937_64 rng(seed);
         std::bernoulli_distribution jump_dist(p_.p_jump);
@@ -163,6 +201,19 @@ public:
             }
         };
 
+        // Per-fill ledger bookkeeping (no-op cost when fill_log == nullptr).
+        // `last_fill_idx` names the fill that currently "owns" the inventory
+        // position -- i.e. the most recent fill -- so that each tick's carry
+        // (computed below exactly as before) can also be attributed to the
+        // fill that created the position being carried, not the fill (if
+        // any) that happens to land on this same tick: a fill's own carry
+        // contribution starts accruing on the *next* tick, once its qty is
+        // actually sitting in inventory.
+        const size_t fill_log_start = fill_log ? fill_log->size() : 0;
+        std::vector<int64_t> vpath;
+        if (fill_log) vpath.reserve(static_cast<size_t>(p_.ticks));
+        int last_fill_idx = -1;
+
         for (int t = 0; t < p_.ticks; ++t) {
             if (t % p_.requote_interval == 0) requote();
 
@@ -196,6 +247,9 @@ public:
             if (scratch.empty()) {
                 ++res.discarded_takers;
                 res.inventory_mark += inv * jump_dir;
+                if (fill_log && last_fill_idx >= 0) {
+                    (*fill_log)[last_fill_idx].inventory_mark_share += inv * jump_dir;
+                }
             } else {
                 const Trade& tr = scratch.front();
                 const bool mm_bought = (side == Side::Sell);  // taker sold -> hit MM's bid
@@ -210,10 +264,36 @@ public:
                 ++res.fills;
                 if (exploiting) ++res.informed_fills;
 
-                res.adverse_cost += -(delta * (v_after_jump - center_at_requote));
-                res.inventory_mark += inv_prev * (v_after_jump - v_before);
+                const int64_t adverse_this_fill = -(delta * (v_after_jump - center_at_requote));
+                const int64_t carry_this_tick = inv_prev * (v_after_jump - v_before);
+                res.adverse_cost += adverse_this_fill;
+                res.inventory_mark += carry_this_tick;
+
+                if (fill_log) {
+                    // This tick's carry belongs to whichever fill is already
+                    // holding the position (inv_prev), i.e. the *previous*
+                    // fill, recorded before this one is appended.
+                    if (last_fill_idx >= 0) {
+                        (*fill_log)[last_fill_idx].inventory_mark_share += carry_this_tick;
+                    }
+                    FillRecord fr;
+                    fr.session_id = session_id;
+                    fr.tick = t;
+                    fr.mm_bought = mm_bought;
+                    fr.qty = qty;
+                    fr.fill_price = price;
+                    fr.v_quote = center_at_requote;
+                    fr.inv_before = inv_prev;
+                    fr.informed = exploiting;
+                    fr.spread_captured = qty * p_.half_spread;
+                    fr.adverse_selection = adverse_this_fill;
+                    fr.inventory_mark_share = 0;
+                    fill_log->push_back(fr);
+                    last_fill_idx = static_cast<int>(fill_log->size()) - 1;
+                }
             }
 
+            if (fill_log) vpath.push_back(v_after_jump);
             v = v_after_jump;
         }
 
@@ -222,6 +302,32 @@ public:
         res.pnl_decomposed = res.gross_capture - res.adverse_cost + res.inventory_mark;
         res.pnl_oracle = cash + inv * v;
         res.identity_ok = (res.pnl_decomposed == res.pnl_oracle);
+
+        // Markouts: how far, and in which direction for the market maker,
+        // did fair value move after each fill, measured from the price
+        // actually traded (not from fair value at fill time -- see README
+        // "Extension: per-fill post-trade attribution" for why). Positive
+        // means favorable to the market maker; a fill whose markout is
+        // consistently negative is a fill that information kept moving
+        // against. Horizons beyond the session's end are clamped to the
+        // last tick and flagged, not extrapolated.
+        if (fill_log) {
+            for (size_t i = fill_log_start; i < fill_log->size(); ++i) {
+                FillRecord& fr = (*fill_log)[i];
+                const int sign = fr.mm_bought ? 1 : -1;
+                const auto markout_at = [&](int horizon_ticks) {
+                    const size_t idx = std::min(static_cast<size_t>(fr.tick + horizon_ticks),
+                                                 vpath.size() - 1);
+                    return sign * (vpath[idx] - fr.fill_price);
+                };
+                fr.markout_1 = markout_at(1);
+                fr.markout_10 = markout_at(10);
+                fr.markout_60 = markout_at(60);
+                fr.markout_1_clamped = fr.tick + 1 > p_.ticks - 1;
+                fr.markout_10_clamped = fr.tick + 10 > p_.ticks - 1;
+                fr.markout_60_clamped = fr.tick + 60 > p_.ticks - 1;
+            }
+        }
         return res;
     }
 

@@ -1,0 +1,10 @@
+500 sessions, 1860698 fills written
+
+sessions: 500  fills: 1860698
+reconciliation: 500 sessions, 0 mismatches (sum of per-fill spread/adverse/inventory-mark == session oracle, exactly)
+
+informed           n    mean markout_1   mean markout_10   mean markout_60
+0            1670952            2.0609            2.0606            2.0628
+1             189746            0.6153            0.6137            0.6036
+
+fills with markout_60 clamped to session end: 27895 / 1860698
