@@ -1,0 +1,2 @@
+nanobind==3.0.1
+pytest

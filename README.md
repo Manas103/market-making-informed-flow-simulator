@@ -26,6 +26,19 @@ markouts at 1, 10 and 60 ticks after each fill. See "Extension: per-fill
 post-trade attribution" below Architecture, and the third part of
 Validation, Findings and Measured results.
 
+**Extension (Nov. 2026):** a zero-friction Python strategy interface over
+the original single-asset `SessionRunner`, via a nanobind binding
+(`python/pymm`). The C++ session loop gains one new hook,
+`Policy::External`, that delegates the bid/ask-size decision to a
+caller-supplied function instead of the two built-in policies; the
+nanobind binding wires that hook to a Python callable. A Python
+re-implementation of the inventory-skew policy, run through this hook,
+reproduces the native C++ policy's session P&L exactly over the full
+500-session sweep, and a dedicated isolated benchmark measures what one
+such decision costs when it crosses into Python. See "Extension: Python
+strategy interface" below Architecture, and the fourth part of
+Validation, Findings and Measured results.
+
 ## Why this exists
 
 Reducing inventory variance is not free, and naming the price paid for it is
@@ -334,6 +347,46 @@ Measuring from `fill_price` rather than from fair value at the fill
 the markout number from the first tick onward; see Findings for what that
 implies about reading the measured numbers.
 
+### Extension: Python strategy interface
+
+The two built-in policies (`FixedSize`, `InventorySkew`) are both one
+`if` branch inside `requote`'s lambda in `session_runner.hpp`. This
+extension adds a third: `Policy::External`, which calls
+`SessionParams::external_quote_fn(inv, base_size, skew_coef, cap,
+bid_size, ask_size)` instead, and otherwise changes nothing about the
+session loop. That is the whole surface a Python policy needs: the
+decision is a pure function of the current inventory and three fixed
+parameters, called once per requote, with no other state leaking across
+the C++/Python boundary.
+
+`python/pymm/binding.cpp` (nanobind) exposes three functions over this
+hook:
+
+- `run_native_inventory_skew(...)`: runs `Policy::InventorySkew` directly,
+  no Python involved. The baseline both other functions are compared
+  against.
+- `run_with_python_policy(..., policy_fn)`: runs `Policy::External` with
+  `external_quote_fn` wired to call the Python callable `policy_fn` and
+  translate its `(bid_size, ask_size)` tuple back into the two output
+  references the hook expects.
+- `benchmark_policy_calls(policy_fn, n_calls)`: calls `policy_fn` back to
+  back `n_calls` times in a tight C++ loop, timed with `std::chrono`
+  inside the extension module (not from Python), to isolate the cost of
+  one Python round trip from the rest of a session's own cost. See
+  "Measured results (Python strategy interface)" for why this, not the
+  whole-session timing difference, is the number reported as the cost
+  per decision.
+
+`tests/external_policy_test.cpp` proves the hook itself is lossless in
+pure C++ first: a C++ lambda implementing the exact same clamp formula as
+`InventorySkew`, run through `Policy::External`, reproduces
+`InventorySkew`'s session P&L bit-for-bit across a 5x3x30 sweep of
+informed-flow rates, spreads and seeds. `python/tests/test_pymm.py` then
+proves the Python half: the same formula, now a real Python function
+called through nanobind, reproduces the native path exactly too, and a
+negative control (a deliberately different Python policy) proves the
+match is not a hook that silently ignores whatever Python returns.
+
 ## Validation
 
 ### 1. Reference-oracle diff (the real test here)
@@ -418,6 +471,32 @@ Two independent layers:
 AddressSanitizer + UBSan clean on `attribution_identity_test` and a
 50-session `run_attribution` smoke run, in the same
 [`docs/asan_ubsan_clean_run.txt`](docs/asan_ubsan_clean_run.txt).
+
+### 9. Python strategy interface (the real test for this extension)
+
+Two layers, matching the pattern every other extension in this README
+uses: prove the hook in pure C++ first, then prove the real cross-
+language path reproduces it.
+
+- `tests/external_policy_test.cpp`: a C++ lambda implementing
+  `InventorySkew`'s exact clamp formula, run through `Policy::External`,
+  reproduces `InventorySkew`'s own session result field for field
+  (`pnl_oracle`, `pnl_decomposed`, `gross_capture`, `adverse_cost`,
+  `inventory_mark`, `final_inventory`, `fills`) across a 5
+  informed-flow-rate x 3 half-spread x 30-seed sweep: 3,150 checks, 0
+  failures, also clean under AddressSanitizer + UBSan (see
+  `docs/asan_ubsan_clean_run.txt`).
+- `python/tests/test_pymm.py`: the same formula, now a genuine Python
+  function called through nanobind via `run_with_python_policy`,
+  reproduces `run_native_inventory_skew`'s result exactly across 10
+  seeds, plus a negative control (`python_always_quote_max_policy`,
+  deliberately wrong) that proves the comparison can fail when the
+  policies actually differ, so the positive result above is not a hook
+  that quietly ignores Python's answer.
+
+Full transcript, including the 500-session sweep behind "Measured
+results (Python strategy interface)" below:
+[`docs/pymm_binding_output.txt`](docs/pymm_binding_output.txt).
 
 ## Findings
 
@@ -535,6 +614,32 @@ that isolates adverse selection with zero spread contribution baked in
 would instead measure from `v_quote`, not from `fill_price`; both are
 documented explicitly above so neither is mistaken for the other.
 
+**The whole-session timing difference between the native and Python-
+policy paths is too noisy on this shared machine to be the per-decision
+number, and measuring it anyway was the first attempt.** The design
+intent was "time 500 native sessions, time 500 Python-policy sessions,
+divide the difference by the number of decisions". The first measurement
+did exactly that and the difference came out negative on more than one
+run (the Python-policy path measuring *faster* than native): the policy
+fires only once every 60 ticks, so its cost is a small fraction of a
+~550us session dominated by order-book matching, well inside this
+machine's run-to-run scheduling noise (see "Resource courtesy" in the
+playbook this repo follows). The fix was not a bigger sweep; it was
+measuring the right thing. `benchmark_policy_calls` isolates exactly the
+Python round trip, timed with `std::chrono` inside the C++ extension, in
+a loop with no session logic around it at all, and that number is stable
+across repeated runs (0.270-0.276us in three consecutive runs) in a way
+the whole-session difference is not. Both numbers are reported below;
+only the isolated one is the per-decision claim.
+
+**The isolated per-decision cost measured well under the 12us design
+target, not over it, which is the opposite direction of most shortfalls
+elsewhere in this README.** A nanobind round trip for a function this
+small (four integer arguments in, a two-integer tuple out) costs a few
+hundred nanoseconds on this machine, not microseconds; reported as
+measured, in both directions, the same discipline this README applies to
+every other number.
+
 ## Measured results
 
 Machine: 8 physical / 16 logical cores (AMD Ryzen 7 7800X3D), WSL2 Ubuntu
@@ -638,6 +743,43 @@ Neither number is negative, and Findings explains precisely why that is
 the expected result of measuring from the actual fill price rather than
 from fair value at the quote.
 
+### Measured results (Python strategy interface)
+
+Machine: 8 physical / 16 logical cores (AMD Ryzen 7 7800X3D), WSL2 Ubuntu
+22.04, g++ 11.4.0 `-O2`, Python 3.10.12, nanobind 3.0.1. Same baseline
+configuration as this README's own Measured Results above (500 sessions,
+4000 ticks/session, 60-tick requote interval, half-spread 2 ticks, 20%
+informed participation, `base_seed=42`). Full transcript, including the
+pure-C++ hook cross-check: [`docs/pymm_binding_output.txt`](docs/pymm_binding_output.txt).
+
+```
+sessions: 500
+decisions per session (requotes): 67
+total decisions: 33500
+sessions with any P&L mismatch: 0 / 500
+native (C++ inventory-skew) total: 0.2742s (548.4 us/session)
+python-policy total:               0.2709s (541.8 us/session)
+added time from routing through Python over a full session: -0.0033s
+isolated policy-call benchmark: 100000 calls in 0.0270s = 0.270 us/decision
+```
+
+| Claim | Measured | Meets claim |
+|---|---|---|
+| 33-contract chain | **33** (11 strikes x 3 expiries), cited from the options extension's own Architecture/Measured Results (not re-measured by this extension) | Yes |
+| Delta hedged on a band policy | Carried from the options extension (`hedge_band`, see "Extension: options market making with delta hedging") | Yes |
+| Python policy reproduced the engine's native session P&L exactly | **0 mismatches / 500 sessions** (`pnl_oracle`, `pnl_decomposed`, `gross_capture`, `final_inventory` all compared field for field) | Yes |
+| 500 seeded sessions | **500**, exactly | Yes |
+| 12us per decision | **0.270us**, isolated benchmark (100,000 calls); the whole-session timing difference, a noisier and less direct measurement, came out at -0.49us/decision on this run (see Findings for why that number is not the one reported) | No (well under, not over; see Findings) |
+
+**The only claim not met as stated is "12us per decision", and it is
+not met in the direction every other unmet claim in this repository
+fails in.** The measured per-decision cost, 0.270us, is roughly 44x
+lower than the resume's number, not higher: a nanobind function call
+over four integers and a two-integer tuple is genuinely cheap on this
+machine, and three repeated runs of the isolated benchmark (0.270,
+0.275, 0.276us) agree closely enough that this is not measurement noise
+in the favorable direction either.
+
 ## Building and running
 
 ```sh
@@ -715,6 +857,25 @@ ASan + UBSan (same `build-asan` tree as above):
 ./run_attribution --policy fixed --sessions 50 --sessions-csv /tmp/s.csv --fills-csv /tmp/f.csv
 ```
 
+Python strategy interface extension:
+
+```sh
+cd build && make external_policy_test && ./external_policy_test && cd ..
+
+# Build the nanobind module (Linux/WSL2 only, built against the Linux
+# Python the venv below uses):
+pip install nanobind==3.0.1
+mkdir -p python/pymm/build && cd python/pymm/build
+cmake -DCMAKE_BUILD_TYPE=Release -Dnanobind_DIR="$(python3 -c 'import nanobind; print(nanobind.cmake_dir())')" ..
+make -j"$(( $(nproc) / 2 ))"
+cd ../../..
+
+python3 -m venv python/.venv && source python/.venv/bin/activate
+pip install -r python/requirements.txt
+PYTHONPATH=python/pymm/build python3 -m pytest python/tests/test_pymm.py -q
+PYTHONPATH=python/pymm/build python3 python/bench_pymm_policy.py
+```
+
 ## Sibling comparison
 
 The matching core is reused unchanged from
@@ -788,3 +949,16 @@ here, not a case of a good existing repo losing to a worse new one.
   measured wall-clock correspondence; and the per-fill CSV `run_attribution`
   produces (1.86M rows for 500 sessions) is not committed, only the raw
   DuckDB summary is, because of its size.
+- **The Python strategy interface only exercises the single-asset
+  `SessionRunner`'s `InventorySkew` policy, not the 33-contract options
+  session.** `OptionsSessionRunner` has no `Policy::External` hook; a
+  Python strategy for the options book would need the same change
+  applied there, which this extension does not do. The Python callable
+  also only decides bid/ask *size*; it cannot change the quoted *price*,
+  the requote cadence, or anything else about the session loop, because
+  `external_quote_fn`'s signature is exactly as wide as `InventorySkew`'s
+  own decision and no wider. The isolated per-decision benchmark measures
+  one specific call shape (four integers in, a two-integer tuple out); a
+  policy that received or returned a larger payload (e.g. a full order
+  book snapshot) would almost certainly cost more than the 0.270us
+  measured here, and that case is not benchmarked.

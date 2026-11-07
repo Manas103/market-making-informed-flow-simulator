@@ -18,6 +18,7 @@
 #pragma once
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <random>
 #include <vector>
 
@@ -39,7 +40,14 @@ inline constexpr int32_t kPriceLevels = 8192;
 inline constexpr int32_t kCenterOffset = kPriceLevels / 2;
 using Book = IntrusiveBook<kPriceLevels>;
 
-enum class Policy { FixedSize, InventorySkew };
+// External: the bid/ask size decision is delegated to `external_quote_fn`
+// instead of the two policies below. See README "Extension: Python
+// strategy interface": the nanobind binding sets this to a wrapper that
+// calls into a caller-supplied Python callable, so the one C++ session
+// loop (fills, matching, the three-bucket P&L decomposition, the oracle
+// identity) is the same loop whether the decision came from C++ or from
+// Python; nothing about the loop is duplicated for the Python path.
+enum class Policy { FixedSize, InventorySkew, External };
 
 struct SessionParams {
     uint64_t base_seed = 42;
@@ -51,6 +59,13 @@ struct SessionParams {
     int64_t base_size = 30;
     int64_t skew_coef = 1;   // size units removed per unit of inventory
     Policy policy = Policy::FixedSize;
+
+    // Only read when policy == External. Receives the current inventory,
+    // base_size, skew_coef and the clamp cap (2*base_size, the same cap
+    // InventorySkew uses) and must write the chosen bid/ask size.
+    std::function<void(int64_t inv, int64_t base_size, int64_t skew_coef, int64_t cap,
+                        int64_t& bid_size, int64_t& ask_size)>
+        external_quote_fn;
 };
 
 struct SessionResult {
@@ -184,6 +199,9 @@ public:
                 const int64_t cap = 2 * p_.base_size;
                 bid_size = std::clamp<int64_t>(p_.base_size - p_.skew_coef * inv, 0, cap);
                 ask_size = std::clamp<int64_t>(p_.base_size + p_.skew_coef * inv, 0, cap);
+            } else if (p_.policy == Policy::External) {
+                const int64_t cap = 2 * p_.base_size;
+                p_.external_quote_fn(inv, p_.base_size, p_.skew_coef, cap, bid_size, ask_size);
             }
             center_at_requote = v;
             scratch.clear();

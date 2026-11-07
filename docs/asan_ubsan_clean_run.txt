@@ -18,3 +18,6 @@ options_pnl_identity_test: 365 checks, 0 failures
 
 =============== run_attribution smoke (50 sessions) ===============
 50 sessions, 185799 fills written
+
+=============== external_policy_test ===============
+external_policy_test: 3150 checks, 0 failures

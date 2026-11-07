@@ -1,0 +1,35 @@
+=== external_policy_test (C++ cross-check) ===
+external_policy_test: 3150 checks, 0 failures
+
+=== python/tests/test_pymm.py ===
+============================= test session starts ==============================
+platform linux -- Python 3.10.12, pytest-6.2.5, py-1.10.0, pluggy-0.13.0 -- /usr/bin/python3
+cachedir: .pytest_cache
+rootdir: /mnt/c/Users/Manas/Downloads/Auto Job Applier/Total Job Application process flow, configfile: pytest.ini
+plugins: colcon-core-0.21.0, cov-3.0.0
+collecting ... collected 12 items
+
+python/tests/test_pymm.py::test_python_policy_reproduces_native_inventory_skew_exactly[0] PASSED [  8%]
+python/tests/test_pymm.py::test_python_policy_reproduces_native_inventory_skew_exactly[1] PASSED [ 16%]
+python/tests/test_pymm.py::test_python_policy_reproduces_native_inventory_skew_exactly[2] PASSED [ 25%]
+python/tests/test_pymm.py::test_python_policy_reproduces_native_inventory_skew_exactly[3] PASSED [ 33%]
+python/tests/test_pymm.py::test_python_policy_reproduces_native_inventory_skew_exactly[4] PASSED [ 41%]
+python/tests/test_pymm.py::test_python_policy_reproduces_native_inventory_skew_exactly[5] PASSED [ 50%]
+python/tests/test_pymm.py::test_python_policy_reproduces_native_inventory_skew_exactly[6] PASSED [ 58%]
+python/tests/test_pymm.py::test_python_policy_reproduces_native_inventory_skew_exactly[7] PASSED [ 66%]
+python/tests/test_pymm.py::test_python_policy_reproduces_native_inventory_skew_exactly[8] PASSED [ 75%]
+python/tests/test_pymm.py::test_python_policy_reproduces_native_inventory_skew_exactly[9] PASSED [ 83%]
+python/tests/test_pymm.py::test_a_different_python_policy_changes_the_outcome PASSED [ 91%]
+python/tests/test_pymm.py::test_benchmark_policy_calls_returns_positive_elapsed_time PASSED [100%]
+
+============================== 12 passed in 0.09s ==============================
+
+=== bench_pymm_policy.py ===
+sessions: 500
+decisions per session (requotes): 67
+total decisions: 33500
+sessions with any P&L mismatch: 0 / 500
+native (C++ inventory-skew) total: 0.2742s (548.4 us/session)
+python-policy total:               0.2709s (541.8 us/session)
+added time from routing through Python over a full session: -0.0033s
+isolated policy-call benchmark: 100000 calls in 0.0270s = 0.270 us/decision
