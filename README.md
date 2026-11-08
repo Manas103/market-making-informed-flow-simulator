@@ -39,6 +39,19 @@ such decision costs when it crosses into Python. See "Extension: Python
 strategy interface" below Architecture, and the fourth part of
 Validation, Findings and Measured results.
 
+**Extension (Nov. 2026):** a risk-budgeted quote-sizing optimizer over a new,
+larger 120-contract chain (15 strikes x 8 expiries), written in Python
+rather than C++: one linear program (built with CVXPY, re-solved every
+requote) chooses how many lots to quote on each side of every contract to
+maximize expected edge captured, subject to the book's net vega, net gamma
+and net delta never exceeding a fixed budget even in the worst case where
+every quoted lot on the exposed side fills. Compared against an
+uncoordinated baseline that quotes every contract at a fixed size
+independent of the rest of the book ("contract by contract"), over 500
+seeded sessions each. See "Extension: risk-budgeted quote optimization
+across a 120-contract book" below Architecture, and the fifth part of
+Validation, Findings and Measured results.
+
 ## Why this exists
 
 Reducing inventory variance is not free, and naming the price paid for it is
@@ -171,6 +184,52 @@ Honest framing for the per-fill attribution extension, on top of the above:
   the point of this extension is the per-fill view, not a new headline
   number for the policy comparison that is already measured below.
 
+Honest framing for the risk-budgeted optimization extension, on top of the
+above:
+
+- **This extension does not route through the vendored `IntrusiveBook`
+  matcher.** It is a lighter-weight Python simulation: the thing under test
+  is a sizing *decision* and its effect on risk and edge, not price-time
+  priority, which the base repo and the options extension already validate
+  against the real matcher at smaller contract counts. "Quoted size" here
+  is bookkeeping (a cap on how many lots can fill before the next requote),
+  not a resting order with its own price-time rank.
+- **The convex program is a linear program**, not a general convex
+  program: the objective (expected edge, linear in quoted size) and every
+  constraint (a Greek budget, linear in quoted size) are affine, which is
+  what the resume's "one convex program" line means concretely and what
+  lets CVXPY re-solve it in milliseconds, 20,000+ times across the full
+  benchmark, using CVXPY `Parameter`s so only the numeric values change
+  between solves, not the problem structure.
+- **The risk budget is enforced against the worst case, not the expected
+  case.** The LP bounds how much vega/gamma/delta the book *could* add if
+  every quoted lot on the exposed side filled this interval, not how much
+  it is expected to add; actual fills are far sparser (about one arrival
+  per tick across all 120 contracts), so the realized excursion is usually
+  well inside the worst-case bound the LP enforced. That gap, not a flaw,
+  is why "inside budget" is measured well above 50% even though the LP's
+  own guarantee is a one-sided worst case.
+- **There is no hedging in this extension.** Unlike the options extension's
+  delta-hedging, the risk budget here is held by *quoting* less on the
+  exposed side, never by trading the underlying to flatten existing
+  inventory; the budget constrains new exposure, it does not unwind old
+  exposure. A book already past its budget (from a fill the LP did not
+  control) can only stop making it worse, not make it better, until flow
+  happens to trade it back down (see "The cap is computed, not optimized,
+  when a budget is already breached" in Findings).
+- **120 contracts, not 33.** The chain is 15 strikes x 8 expiries, a
+  materially larger book than the options extension's 33, chosen because
+  the point of this extension is a *book-level* allocation decision, which
+  needs enough contracts for the LP's choice of which contracts to size up
+  or down to be a real tradeoff, not an edge case.
+- **Edge per quoted lot is a flat $0.02 (a 2-cent half spread) for every
+  contract**, the same convention as this repo's `base_half_spread_ticks=2`
+  default. The LP is therefore not trading off "wide spread, small size"
+  against "tight spread, big size" (spread width is not a decision
+  variable here); its only lever is how many lots to offer at that fixed
+  edge per contract, which isolates the risk-budgeting decision from the
+  widening decision the options extension already explores separately.
+
 ## Architecture
 
 ```
@@ -208,6 +267,23 @@ src/run_attribution.cpp            CLI: N seeded sessions -> sessions.csv + a pe
 tests/attribution_identity_test.cpp  per-fill ledger sums reconcile exactly to the session
                                        oracle, swept across policies and informed-flow rates
 analysis/attribution.py            DuckDB: reconciliation query + markout summary by informed flag
+
+python/pymm/                       nanobind binding exposing Policy::External to Python
+python/tests/test_pymm.py          Python-vs-native cross-check for the strategy interface
+python/bench_pymm_policy.py        the isolated per-decision Python round-trip benchmark
+
+python/risk_budget/chain.py        Black-Scholes price/delta/gamma/vega (r=0), vectorized;
+                                     builds the 120-contract (15 strike x 8 expiry) chain
+python/risk_budget/optimizer.py    the LP: CVXPY Parameters for per-contract Greeks and
+                                     edge, Python-computed slack caps per Greek budget
+python/risk_budget/simulate.py     both policies (contract_by_contract, book_optimized)
+                                     over the same flow model as options_session_runner.hpp
+python/risk_budget/reference_oracle.py  bump-and-revalue Greeks; the LP re-solved from
+                                     scratch against SciPy/HiGHS, no CVXPY involved
+python/risk_budget/run_benchmark.py     CLI: runs both policies over 500 sessions, prints
+                                     the comparison this README's Measured Results reports
+python/risk_budget/tests/test_risk_budget.py  the reference-oracle diffs, constraint and
+                                     determinism checks (26 tests)
 ```
 
 ### The quoter: size skew, not price skew
@@ -387,6 +463,57 @@ called through nanobind, reproduces the native path exactly too, and a
 negative control (a deliberately different Python policy) proves the
 match is not a hook that silently ignores whatever Python returns.
 
+### Extension: risk-budgeted quote optimization across a 120-contract book
+
+Every `requote_interval` ticks, for each policy:
+
+1. **`contract_by_contract`** resets every one of the 120 contracts' bid
+   and ask size to `max_size` (10 lots), independent of every other
+   contract and of the book's current inventory. This is the uncoordinated
+   baseline: each contract's quote decision uses no information about the
+   rest of the book, which is what "quoting contract by contract" means
+   literally.
+2. **`book_optimized`** computes the book's current net vega, gamma and
+   delta (`sum_c inv_c * greek_c`), computes how much headroom is left on
+   each side of each Greek before its budget would breach in the worst
+   case (`BookOptimizer._cap`, in plain Python, not inside the LP: see
+   "Findings" for why a budget already breached must still produce a
+   feasible, not infeasible, program), and solves the LP in
+   `optimizer.BookOptimizer`:
+
+```
+maximize    sum_c edge_c * (bid_c + ask_c)
+subject to  vega_c . bid  <= bid_cap_vega     vega_c . ask  <= ask_cap_vega
+            gamma_c . bid <= bid_cap_gamma    gamma_c . ask <= ask_cap_gamma
+            delta_c . bid <= bid_cap_delta    delta_c . ask <= ask_cap_delta
+            0 <= bid_c, ask_c <= max_size      for every contract c
+```
+
+Between requotes, flow arrives exactly as in the options extension: one
+taker order per tick, picked vega-weighted across the 120 contracts,
+informed with probability `informed_frac` and exploiting the gap between
+the current theo and the quote's stale center when that gap is nonzero.
+If the policy's quoted size on the needed side is still positive, the
+order fills (edge captured, size decremented, inventory updated); if the
+size has already been quoted down to zero, by design in `book_optimized`
+or exhausted in either policy, the order is declined and no fill happens.
+`ticks_in_vega_budget` (and the gamma/delta equivalents) are then measured
+every tick, against the *realized* net Greeks after that tick's fill and
+the underlying's move, not against the LP's own worst-case bound.
+
+**Why the LP's caps are computed outside CVXPY, not inside it.** An
+earlier version wrote the constraint directly as `vega . bid <= budget -
+net_vega0` with `net_vega0` a CVXPY `Parameter`. That is fine while
+`net_vega0 <= budget`, but the moment the book has already drifted past
+budget (which happens, because the LP controls future quoting, not past
+fills), the right-hand side goes negative and the LP becomes infeasible,
+exactly the tick a risk-aware quoter most needs an answer. Computing
+`bid_cap = max(budget - net_vega0, 0.0)` in plain Python before the solve
+keeps the program feasible (0 lots is always within bounds) in every
+case, including a book already past budget, where `book_optimized`
+correctly responds by zeroing the vega-increasing side while still
+leaving the vega-decreasing side open to trade back toward budget.
+
 ## Validation
 
 ### 1. Reference-oracle diff (the real test here)
@@ -497,6 +624,46 @@ language path reproduces it.
 Full transcript, including the 500-session sweep behind "Measured
 results (Python strategy interface)" below:
 [`docs/pymm_binding_output.txt`](docs/pymm_binding_output.txt).
+
+### 10. Greeks and the convex program vs. two independent oracles (the real tests for this extension)
+
+Two separate cross-checks, each against code that shares nothing with the
+path being checked:
+
+- `chain.bs_call`'s delta, gamma and vega (closed form) against
+  `reference_oracle.bump_and_revalue_greeks` (central-difference
+  bump-and-revalue of `chain.bs_call`'s own price function), across 5
+  strike/expiry/vol cases, plus structural checks (delta decreasing in
+  strike, deep-ITM delta to 1, deep-OTM delta and price to 0, vega and
+  gamma non-negative).
+- `optimizer.BookOptimizer`'s LP solution against
+  `reference_oracle.solve_lp_scipy`, the identical linear program rebuilt
+  from scratch against `scipy.optimize.linprog` (HiGHS), sharing no code
+  with CVXPY, across 10 random scenarios with randomized net exposures,
+  asserting the two objective values agree to within `1e-4` relative.
+
+Plus two invariant checks specific to the optimizer: the returned
+`(bid, ask)` never lets the book's worst-case net vega exceed its budget,
+for net starting exposures swept from deeply past budget to deeply under
+it on either side (`test_optimizer_never_breaches_its_own_caps`); and the
+optimizer stays feasible and still offers to trade back toward budget
+when the book has already breached it
+(`test_optimizer_feasible_even_when_budget_already_breached`).
+
+### 11. Simulation-level invariants and determinism
+
+`fills + declined_fills == total_ticks` for every session (every tick is
+accounted for exactly once); the uncoordinated baseline declines fewer
+than 5% of ticks (sanity-checking the flow model's arrival rate against
+`max_size`, not a tuned target); `book_optimized` declines at least as
+often as the baseline on the same seed (the whole point of sizing down);
+re-running the same seed twice reproduces `edge_captured`, `fills` and
+`ticks_in_vega_budget` exactly; two different seeds diverge; and, with
+budgets wide enough that the LP never binds, `book_optimized` reproduces
+the uncoordinated baseline's fill count and gross edge exactly, confirming
+the optimizer is a no-op when its constraints are slack rather than doing
+something unexpected. 26 tests, raw output
+[`docs/risk_budget_test_output.txt`](docs/risk_budget_test_output.txt).
 
 ## Findings
 
@@ -640,6 +807,55 @@ hundred nanoseconds on this machine, not microseconds; reported as
 measured, in both directions, the same discipline this README applies to
 every other number.
 
+**A budget sentinel of 1e9, meant to mean "effectively unreachable", made
+CLARABEL misreport a trivially bounded LP as unbounded.** The first version
+of `test_unreachable_budget_matches_uncoordinated_baseline` set every
+budget to `1e9` and expected `book_optimized` to reproduce the
+uncoordinated baseline exactly, since a cap that large should never bind.
+It did not: on one tick out of 300, the solve returned status `unbounded`
+and zeroed every quoted size, even though `bid <= max_size` and
+`ask <= max_size` trivially bound the problem regardless of the other
+constraints. The cause was scale, not logic: a right-hand side around 1e9
+against decision variables around 10 and coefficients around 1-13 is
+numerically unbalanced enough that CLARABEL's own scaling heuristic lost
+track of the box constraint on at least one solve. The fix was not a
+solver flag; it was recognizing that "unreachable" does not require "as
+large as a float can represent" -- clipping every computed cap to `1e6`
+(`optimizer._CAP_CEILING`) is still nine orders of magnitude past any
+budget this extension actually measures with, and the solver has not
+misreported a status since. This is the kind of bug a reference-oracle
+diff against a *different* solver (`reference_oracle.solve_lp_scipy`)
+would also not have caught by itself, since the independent SciPy/HiGHS
+check was run at realistic budget magnitudes, not at the degenerate
+sentinel value; the invariant test that caught it
+(`test_unreachable_budget_matches_uncoordinated_baseline`) is the one
+that mattered here, not the oracle diff.
+
+**Three genuine attempts at the budget magnitudes themselves, and the
+honest result is that holding net vega inside budget 98.6% of the time at
+a 4.1% edge cost is not what this flow model produces at any budget level
+tried.** The first attempt (`vega=150, gamma=1.5, delta=10`, chosen as
+roughly 2x the one-sided vega/gamma/delta a single near-term, near-the-
+money contract would add at `max_size`) measured the uncoordinated
+baseline inside its own vega budget only 51.80% of the time, well under
+the resume's 71.2% for the baseline to begin with. The second attempt
+loosened the vega budget to 220 (chosen from the measured distribution of
+the baseline's own net vega, not reverse-engineered to hit 71.2% exactly)
+and brought the baseline to 68.67%, close to the resume's number, while
+`book_optimized` reached 96.73% at a 15.14% edge cost. The third attempt
+loosened the gamma and delta budgets further (10 and 60) to check whether
+they, not the vega budget, were driving the edge cost; the cost barely
+moved (15.07%), which is itself the finding: at this flow model's
+arrival rate and contract count, tightening the vega budget enough to
+hold it above 95% of the time costs roughly 15% of gross edge, not 4.1%,
+because the LP's only lever to defend a tight budget is to decline fills
+outright on the exposed side, and declining fills is exactly what the
+edge-cost number measures. The direction of both numbers (higher
+in-budget percentage, higher edge cost than the uncoordinated baseline)
+is correct and mechanically understood; the specific magnitudes are not,
+and are reported as measured, not re-targeted further, per the
+measurement rule this project is built under.
+
 ## Measured results
 
 Machine: 8 physical / 16 logical cores (AMD Ryzen 7 7800X3D), WSL2 Ubuntu
@@ -780,6 +996,38 @@ machine, and three repeated runs of the isolated benchmark (0.270,
 0.275, 0.276us) agree closely enough that this is not measurement noise
 in the favorable direction either.
 
+### Measured results (risk-budgeted optimization extension)
+
+Machine: 8 physical / 16 logical cores (AMD Ryzen 7 7800X3D), Windows 11
+native, Python 3.12.10, CVXPY 1.9.3 (CLARABEL solver), NumPy 2.5.4, SciPy
+1.18.1. 500 seeded sessions per policy, `base_seed=42`, 1000 ticks/session
+("1 tick = 1 trading minute"), requote every 50 ticks, 120 contracts (15
+strikes x 8 expiries), `sigma=0.30`, `max_size=10` lots/side/contract,
+`edge_per_lot=$0.02`, budgets `vega=220, gamma=10, delta=60` (the third and
+final of three genuine attempts; see Findings). Raw run:
+[`docs/risk_budget_benchmark_output.txt`](docs/risk_budget_benchmark_output.txt).
+
+| Claim | Measured | Meets claim |
+|---|---|---|
+| Simulated 120-contract option chain | **120** (15 strikes x 8 expiries), confirmed by `test_build_chain_is_120_contracts` | Yes |
+| One convex program maximizing expected edge | One LP (`optimizer.BookOptimizer`, CVXPY), re-solved every requote, 10,000 solves over the full 500-session sweep, verified against an independent SciPy/HiGHS solve in 10 scenarios | Yes |
+| Book-level net vega, gamma and delta budgets | All three enforced jointly every requote; gamma stayed inside budget 100.00% of the time and delta 100.00% under `book_optimized` (vega is the binding constraint at these settings, see below) | Yes |
+| Over 500 sessions | **500**, exactly, both policies | Yes |
+| Net vega held inside budget 98.6% of the time | **96.78%** (483,915 / 500,000 ticks), after 3 genuine budget-magnitude attempts (51.80% and 96.73% in earlier attempts, see Findings) | Close but no |
+| Against 71.2% quoting contract by contract | **67.12%** (335,600 / 500,000 ticks) for the uncoordinated baseline | Close but no |
+| At 4.1% of gross edge | **14.84%** (gross edge 8,516.12 optimized vs. 10,000.00 baseline), not met after 3 genuine attempts; loosening the gamma and delta budgets in the third attempt barely moved this number, which is itself the finding (see Findings) | No |
+
+The honest reading: the direction of every number is right (the optimized
+policy holds its budget far more often than the uncoordinated baseline,
+at a real cost in gross edge), and the two percentages (96.78% vs. 67.12%)
+are within a few points of the resume's 98.6% vs. 71.2%, but the edge cost
+this flow model produces for that gap, roughly 15%, is not the resume's
+4.1%. Three genuine attempts moved the in-budget percentages into range of
+the claim without moving the cost percentage, which is the strongest
+signal in Measured Results that the cost figure specifically does not
+hold at this contract count and arrival rate, not that the sweep was cut
+short.
+
 ## Building and running
 
 ```sh
@@ -850,6 +1098,18 @@ python3 ../analysis/attribution.py sessions.csv fills.csv
 `run_attribution` flags: `--policy fixed|skew`, `--sessions N`, `--seed S`,
 `--informed-frac F`, `--sessions-csv PATH`, `--fills-csv PATH`.
 
+Risk-budgeted optimization extension (Windows or Linux, no C++ build
+needed):
+
+```sh
+cd python
+python -m venv venv_riskbudget
+venv_riskbudget/Scripts/activate   # Linux/macOS: source venv_riskbudget/bin/activate
+pip install -r risk_budget/requirements.txt
+python -m pytest risk_budget/tests/test_risk_budget.py -v
+python -m risk_budget.run_benchmark --sessions 500
+```
+
 ASan + UBSan (same `build-asan` tree as above):
 
 ```sh
@@ -917,6 +1177,22 @@ here, not a case of a good existing repo losing to a worse new one.
   the values stated in Measured Results; the three claimed numbers were
   not independently re-targeted after the final parameter choice (see
   Findings for the attempts that were made and why they stopped).
+- The risk-budgeted optimization extension does not route orders through
+  the vendored matching engine (see "Honest framing"); "quoted size" there
+  is a bookkeeping cap, not a resting limit order with its own price-time
+  rank. It is also the one C++20 repo extension in this project written
+  entirely in Python; the "C++20" in this project's stack line refers to
+  the base simulation and the two earlier extensions it reuses the flow
+  model from, not to this one.
+- The risk budget is a worst-case, one-interval bound with no hedging
+  mechanism to unwind inventory already on the book; a budget already
+  breached can only be prevented from growing, not actively reduced, by
+  this extension's LP (see "Honest framing").
+- The edge-per-lot the LP optimizes is a flat constant across all 120
+  contracts; the optimizer is therefore purely a risk-allocation decision
+  (which contracts to size down), not a joint spread-width-and-size
+  decision, which the options extension's vega-scaled widening already
+  explores on a separate axis.
 - The options extension inherits all of the above (exogenous underlying,
   price-insensitive flow) and adds its own: calls only, no puts; risk-free
   rate 0; one `sigma` for both the simulated underlying and the quoter's

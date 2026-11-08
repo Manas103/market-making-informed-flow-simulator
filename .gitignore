@@ -9,6 +9,7 @@ CMakeFiles/
 compile_commands.json
 __pycache__/
 venv/
+venv_riskbudget/
 .pytest_cache/
 *.log
 

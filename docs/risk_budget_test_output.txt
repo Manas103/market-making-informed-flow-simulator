@@ -1,0 +1,35 @@
+============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-9.2.0, pluggy-1.7.0 -- C:\Users\Manas\Downloads\Auto Job Applier\Total Job Application process flow\projects\market-making-informed-flow-simulator\python\venv_riskbudget\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\Manas\Downloads\Auto Job Applier\Total Job Application process flow
+configfile: pytest.ini
+collecting ... collected 26 items
+
+risk_budget\tests\test_risk_budget.py::test_greeks_match_bump_and_revalue[100.0-100.0-0.05-0.3] PASSED [  3%]
+risk_budget\tests\test_risk_budget.py::test_greeks_match_bump_and_revalue[100.0-86.0-0.1-0.3] PASSED [  7%]
+risk_budget\tests\test_risk_budget.py::test_greeks_match_bump_and_revalue[100.0-114.0-0.02-0.3] PASSED [ 11%]
+risk_budget\tests\test_risk_budget.py::test_greeks_match_bump_and_revalue[50.0-55.0-0.25-0.45] PASSED [ 15%]
+risk_budget\tests\test_risk_budget.py::test_greeks_match_bump_and_revalue[200.0-180.0-0.5-0.15] PASSED [ 19%]
+risk_budget\tests\test_risk_budget.py::test_greeks_structural_properties PASSED [ 23%]
+risk_budget\tests\test_risk_budget.py::test_build_chain_is_120_contracts PASSED [ 26%]
+risk_budget\tests\test_risk_budget.py::test_optimizer_matches_independent_lp_solver[0] PASSED [ 30%]
+risk_budget\tests\test_risk_budget.py::test_optimizer_matches_independent_lp_solver[1] PASSED [ 34%]
+risk_budget\tests\test_risk_budget.py::test_optimizer_matches_independent_lp_solver[2] PASSED [ 38%]
+risk_budget\tests\test_risk_budget.py::test_optimizer_matches_independent_lp_solver[3] PASSED [ 42%]
+risk_budget\tests\test_risk_budget.py::test_optimizer_matches_independent_lp_solver[4] PASSED [ 46%]
+risk_budget\tests\test_risk_budget.py::test_optimizer_matches_independent_lp_solver[5] PASSED [ 50%]
+risk_budget\tests\test_risk_budget.py::test_optimizer_matches_independent_lp_solver[6] PASSED [ 53%]
+risk_budget\tests\test_risk_budget.py::test_optimizer_matches_independent_lp_solver[7] PASSED [ 57%]
+risk_budget\tests\test_risk_budget.py::test_optimizer_matches_independent_lp_solver[8] PASSED [ 61%]
+risk_budget\tests\test_risk_budget.py::test_optimizer_matches_independent_lp_solver[9] PASSED [ 65%]
+risk_budget\tests\test_risk_budget.py::test_optimizer_never_breaches_its_own_caps PASSED [ 69%]
+risk_budget\tests\test_risk_budget.py::test_cap_is_never_negative_even_when_budget_already_breached PASSED [ 73%]
+risk_budget\tests\test_risk_budget.py::test_optimizer_feasible_even_when_budget_already_breached PASSED [ 76%]
+risk_budget\tests\test_risk_budget.py::test_fills_plus_declines_equals_total_ticks PASSED [ 80%]
+risk_budget\tests\test_risk_budget.py::test_contract_by_contract_never_declines_with_ample_size PASSED [ 84%]
+risk_budget\tests\test_risk_budget.py::test_book_optimized_declines_more_than_baseline PASSED [ 88%]
+risk_budget\tests\test_risk_budget.py::test_determinism_same_seed_same_result PASSED [ 92%]
+risk_budget\tests\test_risk_budget.py::test_different_seeds_give_different_sessions PASSED [ 96%]
+risk_budget\tests\test_risk_budget.py::test_unreachable_budget_matches_uncoordinated_baseline PASSED [100%]
+
+============================= 26 passed in 1.77s ==============================

@@ -1,0 +1,28 @@
+config: ticks=1000 requote_interval=50 informed_frac=0.2 sigma=0.3 max_size=10.0 edge_per_lot=0.02
+budgets: vega=220.0 gamma=10.0 delta=60.0
+sessions: 500  base_seed: 42
+
+--- contract_by_contract (baseline) ---
+sessions: 500  total_ticks: 500000  elapsed: 54.94s
+gross edge captured: 10000.0000
+fills: 500000  declined (no quoted size on the needed side): 0
+ticks with net vega inside budget: 335600 / 500000 (67.12%)
+ticks with net gamma inside budget: 500000 / 500000 (100.00%)
+ticks with net delta inside budget: 498063 / 500000 (99.61%)
+ticks with all three inside budget: 335599 / 500000 (67.12%)
+max |net vega| observed: 1111.63
+
+--- book_optimized (convex program) ---
+sessions: 500  total_ticks: 500000  elapsed: 96.00s
+gross edge captured: 8516.1200
+fills: 425806  declined (no quoted size on the needed side): 74194
+ticks with net vega inside budget: 483915 / 500000 (96.78%)
+ticks with net gamma inside budget: 500000 / 500000 (100.00%)
+ticks with net delta inside budget: 500000 / 500000 (100.00%)
+ticks with all three inside budget: 483915 / 500000 (96.78%)
+max |net vega| observed: 374.07
+
+--- comparison ---
+net vega held inside budget: 96.78% (optimized) vs 67.12% (contract by contract)
+cost of the optimized policy in gross edge: 14.84%
+total elapsed: 150.94s
